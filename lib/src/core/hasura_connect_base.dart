@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:hasura_connect/src/core/hasura.dart';
 import 'package:hasura_connect/src/exceptions/hasura_error.dart';
@@ -10,16 +11,27 @@ import 'package:hasura_connect/src/snapshot/snapshot.dart';
 import 'package:hasura_connect/src/snapshot/snapshot_data.dart';
 import 'package:hasura_connect/src/snapshot/snapshot_info.dart';
 import 'package:hasura_connect/src/utils/utils.dart' as utils;
+import 'package:http/io_client.dart';
+import 'package:http_parser/http_parser.dart';
 import 'package:websocket/websocket.dart';
-import 'package:http/http.dart' as http;
+import 'package:http/http.dart';
 
 import '../../hasura_connect.dart';
+
+// implementação amanda
+IOClient _defaultClient = IOClient(
+  HttpClient(
+    context: SecurityContext.defaultContext,
+  ),
+);
 
 class HasuraConnectBase implements HasuraConnect {
   final _controller = StreamController.broadcast();
   final Map<String, SnapshotData> _snapmap = {};
   Map<String, String> _headers;
   final LocalStorage Function() localStorageDelegate;
+  // variable for add security context
+  Client _httpClient;
 
   LocalStorage _localStorageMutation;
   LocalStorage _localStorageCache;
@@ -35,13 +47,16 @@ class HasuraConnectBase implements HasuraConnect {
   HasuraConnectBase(this.url,
       {Map<String, dynamic> headers,
       this.localStorageDelegate,
-      Future<String> Function(bool isError) token}) {
+      Future<String> Function(bool isError) token,
+      Client httpClient}) {
     _token = token;
     _headers = headers ?? <String, String>{};
     _localStorageMutation = localStorageDelegate();
     _localStorageCache = localStorageDelegate();
     _localStorageMutation.init('hasura_mutations');
     _localStorageCache.init('hasura_cache');
+    // fallback
+    _httpClient = httpClient ?? _defaultClient;
   }
 
   final _init = {
@@ -297,15 +312,15 @@ class HasuraConnectBase implements HasuraConnect {
   }
 
   Future _sendPost(Map jsonMap, [String hash]) async {
-    var jsonString = jsonEncode(jsonMap);
+    // var jsonString = jsonEncode(jsonMap);
 
-    var headersLocal = {
+    Map<String, String> headersLocal = {
       'Content-type': 'application/json',
       'Accept': 'application/json'
     };
 
     if (_token != null) {
-      var t = await _token(false);
+      String t = await _token(false);
       if (t != null) {
         headersLocal['Authorization'] = t;
       }
@@ -317,11 +332,10 @@ class HasuraConnectBase implements HasuraConnect {
       }
     }
 
-    final client = http.Client();
+    var request = await _prepareRequest(url, jsonMap, headersLocal);
     try {
-      var response =
-          await client.post(url, body: jsonString, headers: headersLocal);
-      Map json = jsonDecode(response.body);
+      StreamedResponse response = await _httpClient.send(request);
+      Map<String, dynamic> json = await _parseResponse(response);
 
       if (hash != null) {
         await _localStorageMutation.remove(hash);
@@ -335,18 +349,150 @@ class HasuraConnectBase implements HasuraConnect {
     } catch (e) {
       rethrow;
     } finally {
-      client.close();
+      // client.close();
     }
   }
 
   ///finalize Hasura connection
   void dispose() async {
+    _httpClient.close();
     _disconnect();
     _snapmap.clear();
     await _localStorageMutation.close();
     await _localStorageCache.close();
     await _controller.close();
   }
+}
+
+Future<Map<String, MultipartFile>> _getFileMap(
+  dynamic body, {
+  Map<String, MultipartFile> currentMap,
+  List<String> currentPath = const <String>[],
+}) async {
+  currentMap ??= <String, MultipartFile>{};
+  if (body is Map<String, dynamic>) {
+    final Iterable<MapEntry<String, dynamic>> entries = body.entries;
+    for (MapEntry<String, dynamic> element in entries) {
+      currentMap.addAll(await _getFileMap(
+        element.value,
+        currentMap: currentMap,
+        currentPath: List<String>.from(currentPath)..add(element.key),
+      ));
+    }
+    return currentMap;
+  }
+  if (body is List<dynamic>) {
+    for (int i = 0; i < body.length; i++) {
+      currentMap.addAll(await _getFileMap(
+        body[i],
+        currentMap: currentMap,
+        currentPath: List<String>.from(currentPath)..add(i.toString()),
+      ));
+    }
+    return currentMap;
+  }
+  if (body is MultipartFile) {
+    return currentMap
+      ..addAll(<String, MultipartFile>{currentPath.join('.'): body});
+  }
+
+  // else should only be either String, num, null; NOTHING else
+  return currentMap;
+}
+
+Future<BaseRequest> _prepareRequest(
+  String url,
+  Map<String, dynamic> body,
+  Map<String, String> httpHeaders,
+) async {
+  final Map<String, MultipartFile> fileMap = await _getFileMap(body);
+  if (fileMap.isEmpty) {
+    final Request r = Request('post', Uri.parse(url));
+    r.headers.addAll(httpHeaders);
+    r.body = json.encode(body);
+    return r;
+  }
+
+  final MultipartRequest r = MultipartRequest('post', Uri.parse(url));
+  r.headers.addAll(httpHeaders);
+  r.fields['operations'] = json.encode(body, toEncodable: (dynamic object) {
+    if (object is MultipartFile) {
+      return null;
+    }
+    return object.toJson();
+  });
+  final Map<String, List<String>> fileMapping = <String, List<String>>{};
+  final List<MultipartFile> fileList = <MultipartFile>[];
+
+  final List<MapEntry<String, MultipartFile>> fileMapEntries =
+      fileMap.entries.toList(growable: false);
+
+  for (int i = 0; i < fileMapEntries.length; i++) {
+    final MapEntry<String, MultipartFile> entry = fileMapEntries[i];
+    final String indexString = i.toString();
+    fileMapping.addAll(<String, List<String>>{
+      indexString: <String>[entry.key],
+    });
+    final MultipartFile f = entry.value;
+    fileList.add(MultipartFile(
+      indexString,
+      f.finalize(),
+      f.length,
+      contentType: f.contentType,
+      filename: f.filename,
+    ));
+  }
+
+  r.fields['map'] = json.encode(fileMapping);
+
+  r.files.addAll(fileList);
+  return r;
+}
+
+Future<Map<String, dynamic>> _parseResponse(StreamedResponse response) async {
+  final int statusCode = response.statusCode;
+  final Encoding encoding = _determineEncodingFromResponse(response);
+  // @todo limit bodyBytes
+  final Uint8List responseByte = await response.stream.toBytes();
+  final String decodedBody = encoding.decode(responseByte);
+  final Map<String, dynamic> jsonResponse = jsonDecode(decodedBody);
+
+  if (jsonResponse['data'] == null && jsonResponse['errors']) {
+    if (statusCode < 200 || statusCode >= 400) {
+      throw HasuraError(
+        'Network Error: $statusCode $decodedBody',
+        null,
+      );
+    }
+    throw HasuraError('Invalid response body: $decodedBody', null);
+  }
+
+  return jsonResponse;
+}
+
+/// Returns the charset encoding for the given response.
+///
+/// The default fallback encoding is set to UTF-8 according to the IETF RFC4627 standard
+/// which specifies the application/json media type:
+///   "JSON text SHALL be encoded in Unicode. The default encoding is UTF-8."
+Encoding _determineEncodingFromResponse(BaseResponse response,
+    [Encoding fallback = utf8]) {
+  final String contentType = response.headers['content-type'];
+
+  if (contentType == null) {
+    return fallback;
+  }
+
+  final MediaType mediaType = MediaType.parse(contentType);
+  final String charset = mediaType.parameters['charset'];
+
+  if (charset == null) {
+    return fallback;
+  }
+
+  final Encoding encoding = Encoding.getByName(charset);
+
+  return encoding == null ? fallback : encoding;
 }
 
 /*
