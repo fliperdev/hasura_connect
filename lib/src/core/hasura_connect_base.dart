@@ -457,7 +457,7 @@ Future<Map<String, dynamic>> _parseResponse(StreamedResponse response) async {
   final String decodedBody = encoding.decode(responseByte);
   final Map<String, dynamic> jsonResponse = jsonDecode(decodedBody);
 
-  if (jsonResponse['data'] == null && jsonResponse['errors']) {
+  if (jsonResponse['data'] == null && jsonResponse['errors'] == null) {
     if (statusCode < 200 || statusCode >= 400) {
       throw HasuraError(
         'Network Error: $statusCode $decodedBody',
