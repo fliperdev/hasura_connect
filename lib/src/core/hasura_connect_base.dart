@@ -341,7 +341,7 @@ class HasuraConnectBase implements HasuraConnect {
         await _localStorageMutation.remove(hash);
       }
       if (json.containsKey('errors')) {
-        throw HasuraError.fromJson(json['errors'][0]);
+        throw json;
       }
       return json;
     } on SocketException catch (_) {
